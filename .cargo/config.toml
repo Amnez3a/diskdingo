@@ -1,0 +1,18 @@
+# Cross-compilation settings used by cross.sh.
+#
+# The static Linux (musl) targets link with the system LLVM linker, so no
+# cross gcc is needed. Windows uses the mingw-w64 gcc that the target
+# already defaults to. macOS goes through `cargo zigbuild` (zig provides
+# the Apple linker and libSystem stubs), so it needs nothing here.
+
+[target.x86_64-unknown-linux-musl]
+linker = "ld.lld"
+
+[target.aarch64-unknown-linux-musl]
+linker = "ld.lld"
+
+[target.armv7-unknown-linux-musleabihf]
+linker = "ld.lld"
+
+[target.arm-unknown-linux-musleabihf]
+linker = "ld.lld"

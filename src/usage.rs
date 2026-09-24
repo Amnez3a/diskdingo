@@ -2,7 +2,6 @@
 //! hung network mount cannot stall the whole listing.
 
 use std::collections::HashMap;
-use std::ffi::CString;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -17,7 +16,7 @@ pub struct Usage {
 #[cfg(target_os = "linux")]
 #[allow(clippy::unnecessary_cast)] // field widths differ between libc targets
 pub fn stat_path(path: &str) -> Option<Usage> {
-    let c = CString::new(path).ok()?;
+    let c = std::ffi::CString::new(path).ok()?;
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
         return None;
@@ -35,8 +34,9 @@ pub fn stat_path(path: &str) -> Option<Usage> {
 /// macOS's `statvfs` still uses 32-bit block counts, which overflow on
 /// volumes above 16 TB, so use `statfs` (64-bit) there.
 #[cfg(target_os = "macos")]
+#[allow(clippy::unnecessary_cast)] // field widths differ between libc targets
 pub fn stat_path(path: &str) -> Option<Usage> {
-    let c = CString::new(path).ok()?;
+    let c = std::ffi::CString::new(path).ok()?;
     let mut st: libc::statfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::statfs(c.as_ptr(), &mut st) } != 0 {
         return None;
@@ -49,6 +49,21 @@ pub fn stat_path(path: &str) -> Option<Usage> {
     ))
 }
 
+/// Space statistics for the volume at `path` (`C:\`, `\\?\Volume{..}\`, `Z:\`).
+#[cfg(windows)]
+pub fn stat_path(path: &str) -> Option<Usage> {
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let wide: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
+    let (mut avail, mut total, mut free) = (0u64, 0u64, 0u64);
+    let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut avail, &mut total, &mut free) };
+    (ok != 0).then(|| Usage {
+        size: total,
+        used: total.saturating_sub(free),
+        avail,
+    })
+}
+
+#[cfg_attr(windows, allow(dead_code))]
 fn from_blocks(bsize: u64, blocks: u64, bfree: u64, bavail: u64) -> Usage {
     Usage {
         size: blocks.saturating_mul(bsize),
@@ -111,11 +126,17 @@ mod tests {
 
     #[test]
     fn stats_root_and_missing_path() {
+        let root = if cfg!(windows) { "C:\\" } else { "/" };
+        let missing = if cfg!(windows) {
+            "Q:\\definitely\\not\\here"
+        } else {
+            "/definitely/not/here"
+        };
         let r = stat_all(
-            &["/".to_string(), "/definitely/not/here".to_string()],
+            &[root.to_string(), missing.to_string()],
             Duration::from_secs(5),
         );
-        assert!(r["/"].is_some_and(|u| u.size > 0));
-        assert!(r["/definitely/not/here"].is_none());
+        assert!(r[root].is_some_and(|u| u.size > 0));
+        assert!(r[missing].is_none());
     }
 }

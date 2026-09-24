@@ -14,9 +14,13 @@ $ diskdingo n m     # combine freely; arguments work in any order
 $ diskdingo h       # help
 ```
 
+```
+$ diskdingo u       # add an ID column: the persistent name for zpool create / fstab
+```
+
 Every argument also works with dashes and as a long form:
-`-n`/`--network`, `-m`/`--mounts`, `-a`/`--all`, `-h`/`--help`.
-One-letter flags can be run together (`-nm`). [USAGE.md](USAGE.md) explains
+`-n`/`--network`, `-m`/`--mounts`, `-a`/`--all`, `-u`/`--uuid`, `-h`/`--help`.
+One-letter flags can be run together (`-nmu`). [USAGE.md](USAGE.md) explains
 the columns and each group in detail; `diskdingo h` prints the same.
 
 ```
@@ -56,20 +60,47 @@ up, as `df` does it. A `?` means the filesystem did not answer within
 
 ## Building
 
-Works on Linux and macOS (Intel and Apple Silicon).
+Works on Linux, macOS (Intel and Apple Silicon) and Windows (x86_64).
 
 ```
-./build.sh              # cargo build --release
+./build.sh              # cargo build --release for the machine you are on
 ./target/release/diskdingo
 ```
 
-Cross-check from Linux for macOS targets (type-check only; linking needs
-a macOS SDK):
+### Cross-compiling
 
-```
-rustup target add aarch64-apple-darwin x86_64-apple-darwin
-cargo check --target aarch64-apple-darwin
-```
+`./cross.sh` builds every supported platform from a Linux box into `dist/`:
+
+| File | Runs on |
+|------|---------|
+| `diskdingo-linux-x86_64`  | any x86_64 Linux (static) |
+| `diskdingo-linux-aarch64` | Raspberry Pi 3/4/5, Zero 2, CM4 with a 64-bit OS; any other arm64 Linux (static) |
+| `diskdingo-linux-armv7`   | Raspberry Pi 2/3/4 with a 32-bit OS; other ARMv7 boards (static) |
+| `diskdingo-linux-armv6`   | Raspberry Pi 1, Zero, Zero W, and every Pi running a 32-bit OS (static) |
+| `diskdingo-macos-arm64`   | Apple Silicon Macs |
+| `diskdingo-macos-x86_64`  | Intel Macs |
+| `diskdingo-windows-x86_64.exe` | 64-bit Windows |
+
+The Linux builds are static musl binaries, so they need no particular
+distribution or libc version on the target. Tools needed on the build
+machine (a target is skipped with a message when its tool is missing):
+
+| For | Tool | Install |
+|-----|------|---------|
+| Linux targets | `ld.lld` | `pacman -S lld` / `apt install lld` |
+| Windows | `x86_64-w64-mingw32-gcc` | `pacman -S mingw-w64-gcc` / `apt install gcc-mingw-w64-x86-64` |
+| macOS | `zig` and `cargo-zigbuild` | zig tarball from ziglang.org on `PATH`; `cargo install cargo-zigbuild` |
+
+No Apple SDK is required: zig ships the libSystem stubs. `rustc` still
+prints a warning that `xcrun` was not found; `cross.sh` filters it out.
+Missing `rustup` targets are added automatically. `.cargo/config.toml`
+points the musl targets at `ld.lld`.
+
+`./cross.sh <target> ...` builds a subset, e.g.
+`./cross.sh aarch64-unknown-linux-musl`.
+
+Not covered: Windows on ARM (needs the MSVC toolchain or a `gnullvm`
+sysroot) and 32-bit Windows.
 
 ## How it works
 
@@ -83,7 +114,18 @@ cargo check --target aarch64-apple-darwin
   images) for the disk tree. APFS containers hang off their physical store
   partition; a snapshot mount such as `/dev/disk3s1s1` is attributed to
   `disk3s1`.
+- **Windows** enumerates volumes with `FindFirstVolume`, ties each to its
+  disk and partition number with `IOCTL_STORAGE_GET_DEVICE_NUMBER` and
+  `IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS`, and sizes `\\.\PhysicalDriveN`
+  with `IOCTL_DISK_GET_DRIVE_GEOMETRY_EX`. Every handle is opened with zero
+  access rights, so no administrator prompt is needed. Mapped network
+  drives come from `GetLogicalDrives` + `WNetGetConnection`, `subst`
+  drives from `QueryDosDevice`, and file-backed (VHD) disks are detected
+  through `IOCTL_STORAGE_QUERY_PROPERTY`.
+- **The ID column** (`u`) comes from `/dev/disk/by-id` on Linux (WWN or
+  EUI-64 name first, then interface+model+serial), from `diskutil`'s
+  `DiskUUID` on macOS, and from the volume GUID path on Windows.
 - Space statistics come from `statvfs(3)` (`statfs(2)` on macOS, whose
-  `statvfs` still has 32-bit block counts). Every mount is queried on its
+  `statvfs` still has 32-bit block counts; `GetDiskFreeSpaceEx` on Windows). Every mount is queried on its
   own thread with a shared 5-second deadline, so a hung NFS server cannot
   freeze the listing.

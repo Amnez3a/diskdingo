@@ -6,7 +6,7 @@ mod mounts;
 mod usage;
 
 use devices::{Device, Inventory, Swap};
-use mounts::Mount;
+use mounts::{Class, Mount};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::time::Duration;
@@ -16,42 +16,55 @@ use usage::Usage;
 const STAT_TIMEOUT: Duration = Duration::from_secs(5);
 
 const USAGE: &str = "\
-usage: diskdingo [n] [m] [a] [h]
+usage: diskdingo [n] [m] [a] [u] [h]
   (none)       physical disks and their partitions
   n, network   add network drives and shares
   m, mounts    add other filesystem mounts (bind mounts, subvolumes, ...)
   a, all       show everything, including pseudo filesystems
+  u, uuid      add an ID column with each device's persistent identifier
   h, help      show this help
 Arguments may be given in any order, with or without leading dashes,
-e.g. `diskdingo n m`, `diskdingo -nm`, `diskdingo --network --mounts`.
+e.g. `diskdingo n m`, `diskdingo -nmu`, `diskdingo --network --mounts`.
 
-Columns: DEVICE, SIZE, USED, AVAIL, USE%, FSTYPE, MOUNT. Partitions and
-anything stacked on them (LVM, md, APFS containers and volumes) nest under
-their disk, lsblk-style. SIZE is the block device size on device rows and
-the filesystem size on mount rows. USE% is used / (used + avail) rounded
-up, as df does it. `?` means the filesystem did not answer within
-5 seconds (a stuck network mount) or refused the query.
+Columns: DEVICE, SIZE, USED, AVAIL, USE%, FSTYPE, MOUNT (and ID with u).
+Partitions and anything stacked on them (LVM, md, APFS containers and
+volumes) nest under their disk, lsblk-style. SIZE is the block device
+size on device rows and the filesystem size on mount rows. USE% is
+used / (used + avail) rounded up, as df does it. `?` means the filesystem
+did not answer within 5 seconds (a stuck network mount) or refused the
+query.
 
 What goes where:
-  (none)  disks from /sys/block (Linux) or diskutil (macOS), their
-          partitions, LVM/md/APFS volumes on top of them, swap partitions,
-          and filesystems not tied to one device (ZFS datasets)
+  (none)  disks from /sys/block (Linux), diskutil (macOS) or
+          \\\\.\\PhysicalDriveN (Windows), their partitions, LVM/md/APFS
+          volumes on top of them, swap partitions, and filesystems not
+          tied to one device (ZFS datasets)
   n       mounts of a network type (nfs, cifs/smb, afp, webdav, sshfs,
           rclone, 9p, ceph, gluster, ...) or whose FUSE source looks
-          remote (//host/share, host:/path, user@host:)
+          remote (//host/share, host:/path, user@host:); mapped drive
+          letters on Windows
   m       further mounts of a device already listed, shown as
-          sda2[/@home] (bind mounts, btrfs subvolumes, APFS snapshots),
-          plus FUSE filesystems mounted from a local path (mergerfs, ...)
+          sda2[/@home] (bind mounts, btrfs subvolumes, APFS snapshots,
+          Windows folder mount points), plus FUSE filesystems mounted
+          from a local path (mergerfs, ...) and Windows subst drives
   a       kernel plumbing (proc, sysfs, cgroup, devtmpfs, ...), tmpfs,
           autofs triggers, overlay, squashfs/snaps, anything on a loop
-          device, and mounted disk images
-Each extra group is separated from the previous one by a blank line.";
+          device, mounted disk images (VHD, DMG) and RAM disks
+Each extra group is separated from the previous one by a blank line.
+
+ID column (u): the name to give `zpool create` (or fstab) so it keeps
+working when devices are renumbered. Linux: the /dev/disk/by-id path,
+preferring the drive's WWN or EUI name (independent of the controller
+it is plugged into) over the model+serial name; mount rows show the
+filesystem UUID. macOS: the media UUID, which OpenZFS on OS X keys its
+/var/run/disk/by-id links on. Windows: the volume GUID path.";
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct Opts {
     network: bool,
     mounts: bool,
     all: bool,
+    ids: bool,
 }
 
 fn main() {
@@ -87,7 +100,7 @@ fn main() {
     // (e.g. `diskdingo a | head`), instead of panicking on EPIPE.
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
-    if render(&mut out, &sections, &usages).is_err() {
+    if render(&mut out, &sections, &usages, opts.ids).is_err() {
         std::process::exit(0);
     }
 }
@@ -97,7 +110,7 @@ fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Opts {
     for arg in args {
         let word = arg.trim_start_matches('-');
         // `-nm` / `nm`: several one-letter flags run together.
-        let flags: Vec<String> = if word.len() > 1 && word.chars().all(|c| "nma".contains(c)) {
+        let flags: Vec<String> = if word.len() > 1 && word.chars().all(|c| "nmau".contains(c)) {
             word.chars().map(String::from).collect()
         } else {
             vec![word.to_string()]
@@ -107,6 +120,7 @@ fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Opts {
                 "n" | "network" => o.network = true,
                 "m" | "mounts" => o.mounts = true,
                 "a" | "all" => o.all = true,
+                "u" | "uuid" | "id" => o.ids = true,
                 "h" | "help" => {
                     println!("{USAGE}");
                     std::process::exit(0);
@@ -123,18 +137,6 @@ fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Opts {
 
 // ---------------------------------------------------------------------------
 // Classifying mounts
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Class {
-    /// A real filesystem on a block device: shown by default.
-    Block,
-    /// A network drive or share: -n.
-    Network,
-    /// Some other real filesystem (bind mount, subvolume, FUSE over a path): -m.
-    Other,
-    /// Kernel plumbing, tmpfs, snaps, loop devices, disk images: -a.
-    Pseudo,
-}
 
 const NETWORK_TYPES: &[&str] = &[
     "nfs",
@@ -228,6 +230,9 @@ fn is_network(m: &Mount) -> bool {
 }
 
 fn classify(m: &Mount, inv: &Inventory) -> Class {
+    if let Some(c) = m.class {
+        return c;
+    }
     if is_network(m) {
         return Class::Network;
     }
@@ -246,8 +251,8 @@ fn classify(m: &Mount, inv: &Inventory) -> Class {
 }
 
 /// Is this mount's source the given device? Linux compares device numbers;
-/// macOS compares node paths and also accepts an APFS snapshot of the
-/// device (`/dev/disk3s1s1` is a snapshot of `disk3s1`).
+/// elsewhere node paths are compared, also accepting an APFS snapshot of
+/// the device (`/dev/disk3s1s1` is a snapshot of `disk3s1`).
 fn device_matches(d: &Device, m: &Mount) -> bool {
     match (d.dev, m.blkdev) {
         (Some(a), Some(b)) => a == b,
@@ -284,26 +289,33 @@ struct Row {
     fstype: String,
     mount: String,
     stat: Stat,
+    id: Option<String>,
 }
 
 impl Row {
-    fn for_mount(label: String, m: &Mount) -> Row {
+    fn for_mount(label: String, m: &Mount, inv: &Inventory) -> Row {
         Row {
             device: label,
             size: None,
             fstype: m.fstype.clone(),
             mount: m.target.clone(),
             stat: Stat::Path(m.target.clone()),
+            id: inv.mount_id(m),
         }
     }
 }
 
 /// Source without `/dev/`, plus the mounted subpath for binds/subvolumes:
-/// `sda2[/@home]`.
+/// `sda2[/@home]`. Platform code may supply a label instead.
 fn mount_label(m: &Mount) -> String {
-    let base = m.source.strip_prefix("/dev/").unwrap_or(&m.source);
+    let base = m.label.clone().unwrap_or_else(|| {
+        m.source
+            .strip_prefix("/dev/")
+            .unwrap_or(&m.source)
+            .to_string()
+    });
     if m.root.is_empty() || m.root == "/" {
-        base.to_string()
+        base
     } else {
         format!("{base}[{}]", m.root)
     }
@@ -339,6 +351,7 @@ impl Builder<'_> {
             fstype: "-".into(),
             mount: "-".into(),
             stat: Stat::None,
+            id: d.id.clone(),
         };
         if let Some((&p, rest)) = mine.split_first() {
             let m = &self.mounts[p];
@@ -383,6 +396,11 @@ fn build_sections(opts: Opts, mounts: &[Mount], inv: &Inventory, swaps: &[Swap])
         b.walk(d, "", None);
     }
     let by_target = |a: &usize, c: &usize| mounts[*a].target.cmp(&mounts[*c].target);
+    let labelled = |idx: Vec<usize>| -> Vec<Row> {
+        idx.into_iter()
+            .map(|i| Row::for_mount(mount_label(&mounts[i]), &mounts[i], inv))
+            .collect()
+    };
 
     // Block filesystems with no device row to sit on (ZFS datasets, disks
     // hidden from sysfs inside a container, diskutil failing) go in flat.
@@ -393,11 +411,7 @@ fn build_sections(opts: Opts, mounts: &[Mount], inv: &Inventory, swaps: &[Swap])
         })
         .collect();
     unmatched.sort_by(by_target);
-    devices.extend(
-        unmatched
-            .into_iter()
-            .map(|i| Row::for_mount(mount_label(&mounts[i]), &mounts[i])),
-    );
+    devices.extend(labelled(unmatched));
 
     let mut sections = vec![devices];
     if opts.network || opts.all {
@@ -407,7 +421,7 @@ fn build_sections(opts: Opts, mounts: &[Mount], inv: &Inventory, swaps: &[Swap])
         idx.sort_by(by_target);
         sections.push(
             idx.into_iter()
-                .map(|i| Row::for_mount(mounts[i].source.clone(), &mounts[i]))
+                .map(|i| Row::for_mount(mounts[i].source.clone(), &mounts[i], inv))
                 .collect(),
         );
     }
@@ -416,22 +430,14 @@ fn build_sections(opts: Opts, mounts: &[Mount], inv: &Inventory, swaps: &[Swap])
             .filter(|i| b.classes[*i] == Class::Other || b.secondary.contains(i))
             .collect();
         idx.sort_by(by_target);
-        sections.push(
-            idx.into_iter()
-                .map(|i| Row::for_mount(mount_label(&mounts[i]), &mounts[i]))
-                .collect(),
-        );
+        sections.push(labelled(idx));
     }
     if opts.all {
         let mut idx: Vec<usize> = (0..mounts.len())
             .filter(|i| b.classes[*i] == Class::Pseudo)
             .collect();
         idx.sort_by(by_target);
-        sections.push(
-            idx.into_iter()
-                .map(|i| Row::for_mount(mount_label(&mounts[i]), &mounts[i]))
-                .collect(),
-        );
+        sections.push(labelled(idx));
     }
     sections.retain(|s| !s.is_empty());
     sections
@@ -440,9 +446,11 @@ fn build_sections(opts: Opts, mounts: &[Mount], inv: &Inventory, swaps: &[Swap])
 // ---------------------------------------------------------------------------
 // Output
 
-const HEADER: [&str; 7] = ["DEVICE", "SIZE", "USED", "AVAIL", "USE%", "FSTYPE", "MOUNT"];
+const HEADER: [&str; 8] = [
+    "DEVICE", "SIZE", "USED", "AVAIL", "USE%", "FSTYPE", "MOUNT", "ID",
+];
 /// Columns that are right-aligned (the numeric ones).
-const RIGHT: [bool; 7] = [false, true, true, true, true, false, false];
+const RIGHT: [bool; 8] = [false, true, true, true, true, false, false, false];
 
 /// 1024-based size like lsblk/df -h: 7M, 931.5G, 4G.
 fn human(bytes: u64) -> String {
@@ -469,7 +477,7 @@ fn percent(used: u64, avail: u64) -> String {
     format!("{}%", (u128::from(used) * 100).div_ceil(total))
 }
 
-fn cells(r: &Row, usages: &HashMap<String, Option<Usage>>) -> [String; 7] {
+fn cells(r: &Row, usages: &HashMap<String, Option<Usage>>, ids: bool) -> Vec<String> {
     let dash = || "-".to_string();
     let (fs_size, used, avail, known) = match &r.stat {
         Stat::None => (None, None, None, true),
@@ -480,7 +488,7 @@ fn cells(r: &Row, usages: &HashMap<String, Option<Usage>>) -> [String; 7] {
         },
     };
     let unknown = || if known { dash() } else { "?".to_string() };
-    [
+    let mut out = vec![
         r.device.clone(),
         r.size.or(fs_size).map(human).unwrap_or_else(unknown),
         used.map(human).unwrap_or_else(unknown),
@@ -491,19 +499,25 @@ fn cells(r: &Row, usages: &HashMap<String, Option<Usage>>) -> [String; 7] {
         },
         r.fstype.clone(),
         r.mount.clone(),
-    ]
+    ];
+    if ids {
+        out.push(r.id.clone().unwrap_or_else(dash));
+    }
+    out
 }
 
 fn render<W: Write>(
     out: &mut W,
     sections: &[Vec<Row>],
     usages: &HashMap<String, Option<Usage>>,
+    ids: bool,
 ) -> std::io::Result<()> {
-    let table: Vec<Vec<[String; 7]>> = sections
+    let ncols = if ids { HEADER.len() } else { HEADER.len() - 1 };
+    let table: Vec<Vec<Vec<String>>> = sections
         .iter()
-        .map(|s| s.iter().map(|r| cells(r, usages)).collect())
+        .map(|s| s.iter().map(|r| cells(r, usages, ids)).collect())
         .collect();
-    let mut widths: Vec<usize> = HEADER.iter().map(|h| h.len()).collect();
+    let mut widths: Vec<usize> = HEADER[..ncols].iter().map(|h| h.len()).collect();
     for row in table.iter().flatten() {
         for (c, v) in row.iter().enumerate() {
             widths[c] = widths[c].max(v.chars().count());
@@ -524,7 +538,7 @@ fn render<W: Write>(
             .collect();
         s.join("  ").trim_end().to_string()
     };
-    writeln!(out, "{}", line(&HEADER))?;
+    writeln!(out, "{}", line(&HEADER[..ncols]))?;
     for (i, section) in table.iter().enumerate() {
         if i > 0 {
             writeln!(out)?;
@@ -542,13 +556,7 @@ mod tests {
     use super::*;
 
     fn mount(source: &str, target: &str, fstype: &str) -> Mount {
-        Mount {
-            source: source.into(),
-            target: target.into(),
-            fstype: fstype.into(),
-            root: "/".into(),
-            blkdev: None,
-        }
+        Mount::new(source, target, fstype)
     }
 
     fn args(list: &[&str]) -> Opts {
@@ -570,7 +578,7 @@ mod tests {
             Opts {
                 network: true,
                 mounts: true,
-                all: false
+                ..Opts::default()
             }
         );
         assert_eq!(
@@ -578,15 +586,15 @@ mod tests {
             Opts {
                 network: true,
                 mounts: true,
-                all: false
+                ..Opts::default()
             }
         );
         assert_eq!(
             args(&["am"]),
             Opts {
-                network: false,
                 mounts: true,
-                all: true
+                all: true,
+                ..Opts::default()
             }
         );
         assert_eq!(
@@ -594,6 +602,30 @@ mod tests {
             Opts {
                 all: true,
                 ..Opts::default()
+            }
+        );
+        assert_eq!(
+            args(&["-u"]),
+            Opts {
+                ids: true,
+                ..Opts::default()
+            }
+        );
+        assert_eq!(
+            args(&["--uuid", "n"]),
+            Opts {
+                ids: true,
+                network: true,
+                ..Opts::default()
+            }
+        );
+        assert_eq!(
+            args(&["-nmau"]),
+            Opts {
+                network: true,
+                mounts: true,
+                all: true,
+                ids: true
             }
         );
     }
@@ -659,6 +691,12 @@ mod tests {
                 m.fstype
             );
         }
+        // A platform-supplied class wins over the heuristics.
+        let win = Mount {
+            class: Some(Class::Network),
+            ..mount("\\\\nas\\share", "Z:\\", "remote")
+        };
+        assert_eq!(classify(&win, &inv), Class::Network);
     }
 
     #[test]
@@ -695,6 +733,14 @@ mod tests {
             &disk,
             &mount("/dev/disk3s1s1", "/", "apfs")
         ));
+
+        let guid = "\\\\?\\Volume{1234}\\";
+        let win = Device {
+            name: "Partition2".into(),
+            path: guid.into(),
+            ..Device::default()
+        };
+        assert!(device_matches(&win, &mount(guid, "C:\\", "NTFS")));
     }
 
     #[test]
@@ -704,25 +750,28 @@ mod tests {
             path: "/dev/sda".into(),
             size: Some(1 << 40),
             dev: Some((8, 0)),
+            id: Some("/dev/disk/by-id/wwn-0x1".into()),
             children: vec![
                 Device {
                     name: "sda1".into(),
                     path: "/dev/sda1".into(),
                     size: Some(1 << 30),
                     dev: Some((8, 1)),
-                    children: vec![],
+                    ..Device::default()
                 },
                 Device {
                     name: "sda2".into(),
                     path: "/dev/sda2".into(),
                     size: Some(1 << 39),
                     dev: Some((8, 2)),
-                    children: vec![],
+                    id: Some("/dev/disk/by-id/wwn-0x1-part2".into()),
+                    ..Device::default()
                 },
             ],
         };
         let inv = Inventory {
             tree: vec![sda],
+            fs_uuids: HashMap::from([((8, 2), "9c0e-fs-uuid".to_string())]),
             ..Inventory::default()
         };
         let mut root = mount("/dev/sda2", "/", "btrfs");
@@ -758,12 +807,15 @@ mod tests {
             Stat::Path("/boot".into()),
             "a mounted partition is not reported as swap"
         );
+        assert_eq!(s[0][0].id.as_deref(), Some("/dev/disk/by-id/wwn-0x1"));
+        assert_eq!(s[0][1].id, None);
+        assert_eq!(s[0][2].id.as_deref(), Some("/dev/disk/by-id/wwn-0x1-part2"));
 
         let s = build_sections(
             Opts {
                 network: true,
                 mounts: true,
-                all: false,
+                ..Opts::default()
             },
             &mounts,
             &inv,
@@ -771,9 +823,15 @@ mod tests {
         );
         assert_eq!(s.len(), 3);
         assert_eq!(s[1][0].device, "//nas/share");
+        assert_eq!(s[1][0].id, None);
         assert_eq!(
             (s[2][0].device.as_str(), s[2][0].mount.as_str()),
             ("sda2[/@home]", "/home")
+        );
+        assert_eq!(
+            s[2][0].id.as_deref(),
+            Some("9c0e-fs-uuid"),
+            "mount rows carry the filesystem UUID"
         );
 
         let s = build_sections(
@@ -790,13 +848,95 @@ mod tests {
     }
 
     #[test]
+    fn windows_style_rows() {
+        let guid = "\\\\?\\Volume{abcd}\\";
+        let disk = Device {
+            name: "PhysicalDrive0".into(),
+            path: "\\\\.\\PhysicalDrive0".into(),
+            size: Some(1 << 40),
+            children: vec![Device {
+                name: "Partition3".into(),
+                path: guid.into(),
+                size: Some(1 << 39),
+                id: Some(guid.into()),
+                ..Device::default()
+            }],
+            ..Device::default()
+        };
+        let inv = Inventory {
+            tree: vec![disk],
+            ..Inventory::default()
+        };
+        let mounts = vec![
+            Mount {
+                label: Some("Harddisk0Partition3".into()),
+                class: Some(Class::Block),
+                ..mount(guid, "C:\\", "NTFS")
+            },
+            Mount {
+                label: Some("Harddisk0Partition3".into()),
+                class: Some(Class::Block),
+                ..mount(guid, "C:\\mnt\\data", "NTFS")
+            },
+            Mount {
+                class: Some(Class::Network),
+                ..mount("\\\\nas\\share", "Z:\\", "remote")
+            },
+            Mount {
+                class: Some(Class::Other),
+                ..mount("C:\\Users\\me\\proj", "P:\\", "NTFS")
+            },
+        ];
+        let s = build_sections(
+            Opts {
+                network: true,
+                mounts: true,
+                ids: true,
+                ..Opts::default()
+            },
+            &mounts,
+            &inv,
+            &[],
+        );
+        assert_eq!(s.len(), 3);
+        assert_eq!(
+            (
+                s[0][1].device.as_str(),
+                s[0][1].mount.as_str(),
+                s[0][1].id.as_deref()
+            ),
+            ("└─Partition3", "C:\\", Some(guid))
+        );
+        assert_eq!(
+            (s[1][0].device.as_str(), s[1][0].mount.as_str()),
+            ("\\\\nas\\share", "Z:\\")
+        );
+        let other: Vec<(&str, &str)> = s[2]
+            .iter()
+            .map(|r| (r.device.as_str(), r.mount.as_str()))
+            .collect();
+        assert_eq!(
+            other,
+            [
+                ("Harddisk0Partition3", "C:\\mnt\\data"),
+                ("C:\\Users\\me\\proj", "P:\\")
+            ]
+        );
+        assert_eq!(
+            s[2][0].id.as_deref(),
+            Some(guid),
+            "volume rows show the volume GUID path"
+        );
+    }
+
+    #[test]
     fn unmounted_swap_partition() {
         let sdb1 = Device {
             name: "sdb1".into(),
             path: "/dev/sdb1".into(),
             size: Some(1 << 30),
             dev: Some((8, 17)),
-            children: vec![],
+            ..Device::default()
         };
         let inv = Inventory {
             tree: vec![sdb1],
@@ -850,6 +990,7 @@ mod tests {
                 fstype: "-".into(),
                 mount: "-".into(),
                 stat: Stat::None,
+                id: Some("/dev/disk/by-id/wwn-0x1".into()),
             },
             Row {
                 device: "└─sda1".into(),
@@ -857,6 +998,7 @@ mod tests {
                 fstype: "ext4".into(),
                 mount: "/".into(),
                 stat: Stat::Path("/".into()),
+                id: None,
             },
         ]];
         let usages = HashMap::from([(
@@ -868,13 +1010,20 @@ mod tests {
             }),
         )]);
         let mut out = Vec::new();
-        render(&mut out, &rows, &usages).unwrap();
-        let text = String::from_utf8(out).unwrap();
+        render(&mut out, &rows, &usages, false).unwrap();
         assert_eq!(
-            text,
+            String::from_utf8(out).unwrap(),
             "DEVICE  SIZE  USED  AVAIL  USE%  FSTYPE  MOUNT\n\
              sda       1G     -      -     -  -       -\n\
              └─sda1    1M  512K   512K   50%  ext4    /\n"
+        );
+        let mut out = Vec::new();
+        render(&mut out, &rows, &usages, true).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "DEVICE  SIZE  USED  AVAIL  USE%  FSTYPE  MOUNT  ID\n\
+             sda       1G     -      -     -  -       -      /dev/disk/by-id/wwn-0x1\n\
+             └─sda1    1M  512K   512K   50%  ext4    /      -\n"
         );
     }
 }

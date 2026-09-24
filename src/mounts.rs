@@ -1,7 +1,21 @@
 //! Enumerate mounted filesystems.
 //!
-//! Linux reads `/proc/self/mountinfo`; macOS asks the kernel with
-//! `getfsstat(2)`. Both produce the same [`Mount`] record.
+//! Linux reads `/proc/self/mountinfo`, macOS asks the kernel with
+//! `getfsstat(2)`, Windows walks volumes and drive letters (see
+//! `devices::windows`). All produce the same [`Mount`] record.
+
+/// How a mount is grouped in the output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Class {
+    /// A real filesystem on a block device: shown by default.
+    Block,
+    /// A network drive or share: -n.
+    Network,
+    /// Some other real filesystem (bind mount, subvolume, FUSE over a path): -m.
+    Other,
+    /// Kernel plumbing, tmpfs, snaps, loop devices, disk images: -a.
+    Pseudo,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mount {
@@ -12,10 +26,30 @@ pub struct Mount {
     pub fstype: String,
     /// Subpath of the source filesystem that is mounted. Anything other
     /// than "/" means a bind mount or a subvolume (Linux only; always "/"
-    /// on macOS).
+    /// elsewhere).
     pub root: String,
     /// major:minor of the backing block device, when there is one.
     pub blkdev: Option<(u32, u32)>,
+    /// Name for the DEVICE column when the source is not readable
+    /// (Windows volume GUID paths). `None`: derived from `source`.
+    pub label: Option<String>,
+    /// Grouping decided by the platform code. `None`: decided from the
+    /// filesystem type and source by heuristics in `main`.
+    pub class: Option<Class>,
+}
+
+impl Mount {
+    pub fn new(source: &str, target: &str, fstype: &str) -> Mount {
+        Mount {
+            source: source.to_string(),
+            target: target.to_string(),
+            fstype: fstype.to_string(),
+            root: "/".to_string(),
+            blkdev: None,
+            label: None,
+            class: None,
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -34,11 +68,12 @@ pub fn list_mounts() -> std::io::Result<Vec<Mount>> {
 }
 
 /// Parse the contents of `/proc/self/mountinfo`.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg(any(target_os = "linux", test))]
 pub fn parse_mountinfo(text: &str) -> Vec<Mount> {
     text.lines().filter_map(parse_mountinfo_line).collect()
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn parse_mountinfo_line(line: &str) -> Option<Mount> {
     // 36 35 98:0 /mnt1 /mnt2 rw,noatime master:1 - ext3 /dev/root rw,errors=continue
     // (1)(2)(3)   (4)   (5)      (6)      (7)   (8) (9)   (10)         (11)
@@ -51,19 +86,18 @@ fn parse_mountinfo_line(line: &str) -> Option<Mount> {
     let _options = f.next()?;
     let mut f = f.skip_while(|x| *x != "-");
     f.next()?; // the "-" separator
-    let fstype = f.next()?.to_string();
+    let fstype = f.next()?;
     let source = unescape(f.next()?);
     let blkdev = crate::devices::parse_devnum(devnums).filter(|(major, _)| *major != 0);
     Some(Mount {
-        source,
-        target,
-        fstype,
         root,
         blkdev,
+        ..Mount::new(&source, &target, fstype)
     })
 }
 
 /// Undo the octal escapes mountinfo uses for space, tab, newline and backslash.
+#[cfg(any(target_os = "linux", test))]
 fn unescape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
@@ -105,12 +139,12 @@ pub fn list_mounts() -> std::io::Result<Vec<Mount>> {
     unsafe { buf.set_len(n as usize) };
     Ok(buf
         .iter()
-        .map(|st| Mount {
-            source: cstr(&st.f_mntfromname),
-            target: cstr(&st.f_mntonname),
-            fstype: cstr(&st.f_fstypename),
-            root: "/".to_string(),
-            blkdev: None,
+        .map(|st| {
+            Mount::new(
+                &cstr(&st.f_mntfromname),
+                &cstr(&st.f_mntonname),
+                &cstr(&st.f_fstypename),
+            )
         })
         .collect())
 }
@@ -123,6 +157,11 @@ fn cstr(field: &[libc::c_char]) -> String {
         .map(|&c| c as u8)
         .collect();
     String::from_utf8_lossy(&bytes).into_owned()
+}
+
+#[cfg(windows)]
+pub fn list_mounts() -> std::io::Result<Vec<Mount>> {
+    Ok(crate::devices::windows::scan().mounts.clone())
 }
 
 #[cfg(test)]
@@ -150,6 +189,7 @@ garbage line";
             m[0].blkdev, None,
             "anonymous major 0 must not count as a block device"
         );
+        assert_eq!(m[0].class, None);
         assert_eq!(m[1].blkdev, Some((8, 1)));
         assert_eq!(m[1].root, "/");
         assert_eq!(m[2].root, "/@home");
