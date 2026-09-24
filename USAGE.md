@@ -177,8 +177,30 @@ $ diskdingo a | grep tmpfs
 ./build.sh               # cargo build --release
 ./deploy.sh              # install to /usr/bin (sudo if needed)
 ./deploy.sh ~/.local/bin # or any other directory
-./cross.sh               # every platform into dist/ (see README)
+./cross.sh               # every platform into dist/
 ```
+
+`cross.sh` produces one binary per platform in `dist/`. Copy the right one
+onto the target machine and put it somewhere on `PATH` (for example
+`/usr/local/bin/diskdingo`); nothing else needs to be installed.
+
+| Binary | Runs on |
+|--------|---------|
+| `diskdingo-linux-x86_64`       | Any x86_64 Linux. Static, no libc version requirement. |
+| `diskdingo-linux-aarch64`      | Raspberry Pi 3, 4, 5, 400, Zero 2 W and CM3/CM4 running a 64-bit OS; any other arm64 Linux (Rock, Orange Pi, Jetson, arm64 servers). Static. |
+| `diskdingo-linux-armv7`        | Raspberry Pi 2, 3, 4, 400, Zero 2 W and CM3/CM4 running a 32-bit OS; other ARMv7 boards (BeagleBone, older Odroid). Static. |
+| `diskdingo-linux-armv6`        | Raspberry Pi 1, Zero, Zero W and CM1. Also runs on every other Pi with a 32-bit OS, so it is the safe pick when unsure. Static. |
+| `diskdingo-macos-arm64`        | Apple Silicon Macs (M1 and later). |
+| `diskdingo-macos-x86_64`       | Intel Macs. |
+| `diskdingo-windows-x86_64.exe` | 64-bit Windows 10 and 11, and Windows Server. |
+
+Which Pi build to use depends on the OS, not the board: `uname -m` on the
+Pi prints `aarch64` for a 64-bit OS (use the aarch64 binary) and `armv7l`
+or `armv6l` for a 32-bit OS (use armv7 or armv6 respectively; armv6 works
+on both). Not provided: Windows on ARM and 32-bit Windows.
+
+See [README.md](README.md) for the tools `cross.sh` needs on the build
+machine.
 
 See [README.md](README.md) for how the tool gathers its data on each
 platform.

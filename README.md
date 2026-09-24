@@ -71,15 +71,19 @@ Works on Linux, macOS (Intel and Apple Silicon) and Windows (x86_64).
 
 `./cross.sh` builds every supported platform from a Linux box into `dist/`:
 
-| File | Runs on |
-|------|---------|
-| `diskdingo-linux-x86_64`  | any x86_64 Linux (static) |
-| `diskdingo-linux-aarch64` | Raspberry Pi 3/4/5, Zero 2, CM4 with a 64-bit OS; any other arm64 Linux (static) |
-| `diskdingo-linux-armv7`   | Raspberry Pi 2/3/4 with a 32-bit OS; other ARMv7 boards (static) |
-| `diskdingo-linux-armv6`   | Raspberry Pi 1, Zero, Zero W, and every Pi running a 32-bit OS (static) |
-| `diskdingo-macos-arm64`   | Apple Silicon Macs |
-| `diskdingo-macos-x86_64`  | Intel Macs |
-| `diskdingo-windows-x86_64.exe` | 64-bit Windows |
+| File | Rust target | Runs on |
+|------|-------------|---------|
+| `diskdingo-linux-x86_64`  | `x86_64-unknown-linux-musl` | any x86_64 Linux (static) |
+| `diskdingo-linux-aarch64` | `aarch64-unknown-linux-musl` | Raspberry Pi 3/4/5/400, Zero 2 W, CM3/CM4 with a 64-bit OS; any other arm64 Linux (static) |
+| `diskdingo-linux-armv7`   | `armv7-unknown-linux-musleabihf` | Raspberry Pi 2/3/4/400, Zero 2 W, CM3/CM4 with a 32-bit OS; other ARMv7 boards (static) |
+| `diskdingo-linux-armv6`   | `arm-unknown-linux-musleabihf` | Raspberry Pi 1, Zero, Zero W, CM1, and every Pi running a 32-bit OS (static) |
+| `diskdingo-macos-arm64`   | `aarch64-apple-darwin` | Apple Silicon Macs |
+| `diskdingo-macos-x86_64`  | `x86_64-apple-darwin` | Intel Macs |
+| `diskdingo-windows-x86_64.exe` | `x86_64-pc-windows-gnu` | 64-bit Windows 10/11 and Server |
+
+On a Pi, `uname -m` says which Linux build to use: `aarch64` (64-bit OS),
+`armv7l` or `armv6l` (32-bit OS; armv6 runs on both). [USAGE.md](USAGE.md)
+has the same table with more board detail.
 
 The Linux builds are static musl binaries, so they need no particular
 distribution or libc version on the target. Tools needed on the build
