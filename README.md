@@ -49,6 +49,26 @@ up, as `df` does it. A `?` means the filesystem did not answer within
 ./deploy.sh ~/.local/bin # or any other directory
 ```
 
+### Nix
+For NixOS/Nix users with flakes enabled
+fast start:
+```bash
+nix run github:low-orbit-flux/diskdingo -- h
+```
+inputs:
+```nix
+inputs.diskdingo = {
+  url = "github:low-orbit-flux/diskdingo";
+  inputs.nixpkgs.follows = "nixpkgs";
+};
+```
+```nix
+environment.systemPackages = [
+  inputs.diskdingo.packages.${pkgs.system}.default
+];
+```
+The flake supports Linux (x86_64, aarch64)
+
 ## What goes where
 
 | Shown with | Contents |
