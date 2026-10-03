@@ -51,6 +51,7 @@ up, as `df` does it. A `?` means the filesystem did not answer within
 
 ### Nix
 For NixOS/Nix users with flakes enabled
+
 fast start:
 ```bash
 nix run github:low-orbit-flux/diskdingo -- h
